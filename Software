@@ -1,0 +1,367 @@
+/*
+* Sonar_LCD_motor.c
+*
+* Created: 19/04/2015 00:33:57
+* Author: Orlando Vieira
+*/ 
+
+/*************************************INICIO DAS DEFINIÇÕES******************************************/
+
+#define F_CPU 800000UL
+#include <avr/io.h>
+#include <avr/wdt.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+/************************************************MACROS*************************************************/
+
+//SONAR
+#define SONAR_PORT PORTD
+#define SONAR_DDR DDRD
+#define SONAR_PIN PIND
+#define TRIGE_BIT 1       // Trigger do Sonar Esquerdo, ligado ao PD1
+#define ECHOE_BIT 2       // Echo do Sonar Esquerdo, ligado ao PD2 (INT0)
+#define TRIGD_BIT 0       // Trigger do Sonar Direito, ligado ao PD0
+#define ECHOD_BIT 3 // Echo do Sonar Direito, ligado ao PD3 (INT1)
+#define LED_VERD 6 // Led Verde ligado ao PD6, led pisca
+#define LED_AMARL 7 // Led Amarelo ligado ao PD7, ligado quando deteta preto
+#define LED_VERM 5 // Led Vermelho ligado ao PD5, ligado quando deteta objecto a determinada distancia
+
+ //Ponte H
+#define MOTOR_PORT PORTB
+#define MOTOR_DDR DDRB
+#define MOTOR_PIN PINB
+
+#define M1A_BIT 0 //input 1 - motor esquerdo
+#define M1EN_BIT 1 //Enable 1,2 - motor esquerdo
+#define M2EN_BIT 2 //Enable 3,4 - motor direito
+#define M4A_BIT 3 //input 1 - motor direito
+#define M2A_BIT 4 //input 2 - motor esquerdo
+#define M3A_BIT 5 //input 2 - motor direito
+
+//movimentos
+#define TRAS_ESQ MOTOR_PORT|= (1 << PB0) // Roda esquerda, rotação para trás
+#define FRENTE_ESQ MOTOR_PORT|= (1 << PB4) // Roda esquerda, rotação para a frente
+#define TRAS_DIR MOTOR_PORT|= (1 << PB3) // Roda direita, rotação para trás
+#define FRENTE_DIR MOTOR_PORT|= (1 << PB5) // Roda direita, rotação para a frente
+#define TRAS MOTOR_PORT|= (1 << PB0)|(1 << PB3) // Ambas rodas para trás
+
+#define FRENTE MOTOR_PORT|= (1 << PB4)|(1 << PB5) // Ambas rodas para a frente
+#define STOP (PORTB=0) // Ambas rodas paradas
+#define RODA_ESQ OCR1A // OCR1 do pwm ligado a Enable 1,2 ,controla a velocidade da roda esquerda
+#define RODA_DIR OCR1B // OCR1 do pwm ligado a Enable 3,4 ,controla a velocidade da roda direita
+#define MAX_ESQ RODA_ESQ=255 // Define o valor máximo do OCR1 para a roda esquerda
+#define MAX_DIR RODA_DIR=255 // Define o valor máximo do OCR1 para a roda direita
+#define MED_ESQ RODA_ESQ=200 // Define o valor intermédio do OCR1 para a roda esquerda
+#define MED_DIR RODA_DIR=200 // Define o valor intermédio do OCR1 para a roda direita
+#define MIN_ESQ RODA_ESQ=150 // Define o valor minimo do OCR1 para a roda esquerda
+#define MIN_DIR RODA_DIR=150 // Define o valor minimo do OCR1 para a roda direita
+#define VALORD mediaD // Media de valores do sonar direito
+#define VALORE mediaE // Media de valores do sonar esquerdo
+
+volatile unsigned char startEsq = 0, startDir=0, ativoE = 0, ativoD=0, flag_preto=0;
+volatile uint16_t contadorD =0, contadorE=0, mediaD=0, mediaE=0, distanciaD = 0, distanciaE=0;
+uint8_t i=0,j=0, sumE[4], sum[4], linha=0, cont500ms=0;
+
+/*************************************FIM DAS MACROS******************************************/
+
+/***************FUNÇÕES DE MOVIMENTO*************************************/
+
+void heavy_right() // Quando chamada, o veiculo gira 90 graus para a direita
+{ 
+  MAX_DIR;
+  MAX_ESQ;
+  FRENTE_ESQ;
+  TRAS_DIR;
+  _delay_ms(250);
+  STOP;
+}
+
+void medium_right() // Quando chamada, o veiculo gira 45 graus para a direita
+{
+  MED_DIR;
+  MED_ESQ;
+  FRENTE_ESQ;
+  TRAS_DIR;
+  _delay_ms(250);
+  STOP;
+}
+
+void heavy_left() // Quando chamada, o veiculo gira 90 graus para a esquerda
+{
+  MAX_DIR;
+  MAX_ESQ;
+  FRENTE_DIR;
+  TRAS_ESQ;
+  _delay_ms(250);
+  STOP;
+}
+
+void medium_left() // Quando chamada, o veiculo gira 45 graus para a esquerda
+{
+  MED_DIR;
+  MED_ESQ;
+  FRENTE_DIR;
+  TRAS_ESQ;
+  _delay_ms(250);
+  STOP;
+}
+
+void invert_right() // Quando chamada, o veiculo gira 180graus para a direita
+{
+  MAX_DIR;
+  MAX_ESQ;
+  FRENTE_ESQ;
+  TRAS_DIR;
+  _delay_ms(500);
+  STOP;
+} 
+
+void invert_left() // Quando chamada, o veiculo gira 180graus para a esquerda
+{
+  MAX_DIR;
+  MAX_ESQ;
+  MOTOR_PORT|= (1 << PB3)|(1 << PB4);
+  _delay_ms(500);
+  STOP;
+}
+
+ // Quando chamada, o veiculo anda para trás
+
+/********************************FIM DAS FUNÇÕES DE MOVIMENTO*******************************************/
+
+void movimento() // Função responsável por comparar os valores lidos pelos 2 sonares e atribuir o movimento ao veiculo
+{ // de modo a evitar os obstaculos se:
+  if(VALORE < VALORD) // Objeto à esquerda
+  {
+    if ((VALORE>0) && (VALORE<=10)) // Se o objeto esta entre 0 e 10cm do sonar esq 
+    {
+      SONAR_PORT|= (1<<LED_VERM); // Acende Led Vermelho
+      TRAS; //Recua
+      MED_DIR; //
+      MED_ESQ; //Velocidade Media
+      _delay_ms(100); //durante 100ms
+      heavy_right(); // E gira para a direita 90graus
+    }  
+    else
+    if ((VALORE>10) && (VALORE<=20)) // Entre 10 e 20 cm aproxima-se do objecto a velocidade media
+    {
+      SONAR_PORT&= ~(1<<LED_VERM); // Desliga led Vermelho
+      FRENTE;
+      MED_ESQ;
+      MED_DIR;
+    }
+    else
+    if (VALORE>20) // Para objectos >20 cm aproxima-se do objecto a maxima velocidade
+    {
+      SONAR_PORT&= ~(1<<LED_VERM);
+      FRENTE;
+      MAX_DIR;
+      MAX_ESQ;
+    }
+  }
+  else // Similar ao segmento de codigo anterior, muda apenas a direção
+  if(VALORD < VALORE) // Objeto à direita
+  {
+    if ((VALORD>0) && (VALORD<=10))
+    {
+      SONAR_PORT|= (1<<LED_VERM);
+      STOP;
+      TRAS;
+      MAX_DIR;
+      MAX_ESQ;
+      _delay_ms(100);
+      heavy_left();
+    }
+    else
+    if ((VALORD>10) && (VALORD<=20))
+    {
+      SONAR_PORT&= ~(1<<LED_VERM); 
+      FRENTE;
+      MIN_ESQ;
+      MIN_DIR;
+    }
+    else
+    if (VALORD>20)
+    {
+      SONAR_PORT&= ~(1<<LED_VERM);
+      FRENTE;
+      MAX_DIR;
+      MAX_ESQ;
+    }
+  }
+}
+
+ISR(ADC_vect) // 1us
+{
+  linha=ADCH;
+  if (linha>200)
+  {
+    SONAR_PORT|= (1<<LED_AMARL);
+    flag_preto=1;
+    invert_left();
+  }
+  else
+    SONAR_PORT&= ~(1<<LED_AMARL);
+  flag_preto=0;
+}
+
+ISR(TIMER2_OVF_vect) 
+{
+  if (startEsq) // Iniciada a contagem do tempo,
+  {
+    contadorE++; // incrementa contadorE++, numero de overflows da interrupção
+  }
+  if (startDir) // Iniciada a contagem do tempo,
+  {
+    contadorD++; // incrementa contadorD++, numero de overflows da interrupção
+  }
+}
+
+ISR(TIMER0_COMPA_vect) // interrupção de 0.05s
+{
+  if(flag_preto==0)
+  {
+    ADCSRA|=0x40; //Inicia Conversão AD
+  }
+  
+  cont500ms++;
+  if(cont500ms==10) //apos 10 interrupções (0.5s) verifica a condição
+  {
+    SONAR_PORT^=(1<<LED_VERD);// operação Xor, altera o estado do bit0 do PORTB
+    cont500ms=0; //reset a variavel
+  }
+}
+
+//SONAR ESQUERDO
+ISR(INT0_vect) //Interrupção externa 0, chamada sempre que houver mudanças de flanco do Echo esquerdo 
+{
+  if (ativoE) // Aceita a interrupção apenas quando o trig foi enviado, deve ser iniciado o contador
+  { 
+    if (startEsq == 0)
+    { //flanco ascendente, reset do contador.
+      startEsq = 1;
+      contadorE = 0; // reset da variavel responsável por contabilizar os overflows do Timer0
+      TCNT0 = 0; // reset timer counter0
+    }
+    else
+    { // flanco descendente, parar a contagem do tempo e inicia calculos da 
+      distancia
+      startEsq=0;
+      mediaE = 0; // reset à variavel media de distâncias lidas
+      for (j = 0; j<4 ; j++) // calculo da media de 4 valores lidos 
+      {
+        distanciaE = (contadorE * 256 + TCNT0) / 58;
+        sumE[j] = distanciaE;
+        mediaE= ((sumE[0]+sumE[1]+sumE[2]+sumE[3])/4);
+      }
+      ativoE = 0; //reset da flag
+    }
+  }
+}
+
+//SONAR DIREITO
+ISR(INT1_vect) //Interrupção externa 0, chamada sempre que houver mudanças de flanco do Echo esquerdo 
+{ 
+  if (ativoD) // Aceita a interrupção apenas quando o trig foi enviado, deve ser iniciado o contador
+  { //aceita interrupção APENAS quando o sonar começou
+    if (startDir == 0) 
+    { //flanco ascendente, reset do contador.
+      startDir = 1;
+      contadorD = 0; // reset da variavel responsável por contabilizar os overflows do Timer0
+      TCNT0 = 0; // reset timer counter0
+    }
+    else
+    { // flanco descendente, parar a contagem do tempo e inicia calculos da distancia
+      startDir=0;
+      mediaD = 0; // reset à variavel media de distâncias lidas
+      for (i = 0; i<4 ; i++)
+      {
+        distanciaD = (contadorD * 256 + TCNT0) / 58; // calculo da media de 4 valores lidos 
+        sum[i] = distanciaD;
+        mediaD= ((sum[0]+sum[1]+sum[2]+sum[3])/4);
+      }
+      ativoD = 0; //reset da flag
+    }
+  }
+}
+
+void trigger_esq() //Função para ativar trigger do sonar esquerdo durante 10us
+{ 
+   SONAR_PORT&= ~(1 << TRIGE_BIT); // Clear ao bit conetado ao trigger
+   _delay_us(5); 
+   SONAR_PORT|= (1 << TRIGE_BIT); // Set ao bit conetado ao trigger 
+   ativoE = 1; // Set da flag que indica que deve ser feita a leitura do sonar esquerdo
+   _delay_us(10); // 10us - tempo do trigger emitir o ultrassonico
+   SONAR_PORT&= ~(1 << TRIGE_BIT); // Clear ao bit conetado ao trigger
+}
+
+void trigger_dir() //Função para ativar trigger do sonar direito
+{
+   SONAR_PORT&= ~(1 << TRIGD_BIT); // Clear ao bit conetado ao trigger
+   _delay_us(5);
+   SONAR_PORT|= (1 << TRIGD_BIT); // Set ao bit conetado ao trigger 
+   ativoD = 1; // Set da flag que indica que deve ser feita a leitura do sonar direito
+   _delay_us(10); // 10us - tempo do trigger emitir o ultrassonico
+   SONAR_PORT&= ~(1 << TRIGD_BIT); // Clear ao bit conetado ao trigger
+}
+
+/******************************************INICIALIZAÇÕES***********************************************/
+
+void inic()
+{ 
+    // PORTS 
+    MOTOR_DDR |= (1<<M1A_BIT) | (1<<M2A_BIT) | (1<<M3A_BIT) | (1<<M4A_BIT) | (1<<M1EN_BIT) | (1<<M2EN_BIT);
+
+     //SONAR 
+    SONAR_DDR |= (1<<TRIGD_BIT)|(1<<TRIGE_BIT) | (1<<LED_VERD) | (1<<LED_AMARL) | (1<<LED_VERM); 
+    SONAR_DDR &=~(1<<ECHOD_BIT) & ~(1<<ECHOE_BIT);
+    SONAR_PORT&=~(1<<TRIGD_BIT) &~(1<<TRIGE_BIT) & ~(1<<LED_VERD) & ~(1<<LED_AMARL) & ~(1<<LED_VERM); 
+
+    EICRA|= (0 << ISC11) | (1 << ISC10) | (0 << ISC01) | (1 << ISC00); // Habilita interrupção em qualquer extremo (ascendente/descendente)
+    EIMSK|= (1 << INT1) |(1 << INT0); // Habilita INT1 e INT0
+
+   TCCR2A=0;
+   TCCR2B=(0<<CS02)|(0<<CS01)|(1<<CS00); // internal clock sem prescaling
+   TCNT2=0; // reset counter
+   TIMSK2=1<<TOIE2; // ativa timer interrupt
+
+   OCR0A=194; // OCR de 194
+   TCCR0A=0b00000010; //define o timer0 como modo CTC com OC0A e OC0B desconectados
+   TCCR0B=0b00000100; // com timer counter em modo normal (update imediato) e prescaler a 256
+   TIMSK0=0b00000010;// define o modo de interrupção como comparador
+
+   ADMUX|=(1<<REFS0)|(1<<ADLAR); //avcc capacitor at vref, ajustado à esq, adc0 selecionado
+   ADCSRA|=(1<<ADEN)|(1<<ADIE)|(1<<ADPS2); //habilita AD, Habilita interrupçao, prescaler=16
+
+   sei(); // enable all(global) interrupts
+
+   // MOTORES
+   RODA_DIR=0;
+   RODA_ESQ=0;
+   TCCR1A=0b10100001; // Clear OC1A/OC1B on Compare Match when upcounting. Set OC1A/OC1B when downcounting
+   TCCR1B=0b00000001; // PHASE CORRECT PWM, no prescaler
+
+   ADCSRA= 0x40; //Inicia Conversão AD
+}
+
+int main()
+{
+    inic();
+    while(1)
+    {
+      movimento(); // chamada da função responsável pelos movimentos dos motores
+      if(ativoE==0) // A leitura terminada do sonar esquerdo, fazer nova leitura
+      {
+        _delay_ms(10);
+        trigger_esq(); // função para activar o trigger
+      }
+      if(ativoD==0) // A leitura terminada do sonar direito, fazer nova leitura
+      {
+        _delay_ms(10);
+        trigger_dir(); // função para activar o trigger
+      }
+    }
+}
